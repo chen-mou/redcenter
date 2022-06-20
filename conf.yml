@@ -1,0 +1,4 @@
+redis:
+  local:
+    host: localhost
+    ip: 6379
