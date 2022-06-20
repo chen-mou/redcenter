@@ -1,0 +1,2 @@
+# redcenter
+基于redis的注册中心，redis采用主从复制实现高可用以及较高的一致性
