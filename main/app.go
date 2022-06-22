@@ -1,26 +1,23 @@
 package main
 
 import (
-	"fmt"
-	"reflect"
+	"RedisRegister/main/client/redis"
 )
 
 func main() {
-	//con := redis.RedisClient{}
-	//con.Open(&redis.Configure{Host: "localhost", Port: "6379"})
-	//fmt.Println(con.Set("1", map[string]interface{}{
-	//	"a": "b",
-	//	"c": "d",
-	//}).Result())
-	//fmt.Println(con.Get("1").Result())
-	m := map[string]string{
-		"a": "b",
-		"c": "d",
-		"e": "f",
+	con := redis.Client{}
+	con.Open(&redis.Configure{Host: "localhost", Port: "6379"})
+	type Health struct {
+		Status string
+		Url    string
 	}
-	v := reflect.ValueOf(m)
-	keys := v.MapKeys()
-	for _, val := range keys {
-		fmt.Println(val.String() + ":" + v.MapIndex(val).String())
+	s := struct {
+		Health Health
+	}{
+		Health: Health{
+			Status: "Up",
+			Url:    "localhost123456789",
+		},
 	}
+	con.HSet("webapp", s)
 }

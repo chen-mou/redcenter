@@ -2,11 +2,13 @@ package redis
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -14,10 +16,11 @@ const (
 	Follower = "follower"
 )
 
-type RedisClient struct {
+type Client struct {
 	Conf   *Configure
 	conn   net.Conn
-	master *RedisClient
+	master *Client
+	lock   lockMap
 }
 
 type Configure struct {
@@ -28,15 +31,18 @@ type Configure struct {
 	Master   *Configure
 }
 
-func (client *RedisClient) Open(conf *Configure) {
+type lockMap map[string]*sync.Mutex
+
+func (client *Client) Open(conf *Configure) {
 	con, err := net.Dial("tcp", conf.Host+":"+conf.Port)
 	if err != nil {
 		panic(err)
 	}
 	client.conn = con
+	client.lock = lockMap{}
 }
 
-func (client *RedisClient) Set(key string, value interface{}) *ResCmd {
+func (client *Client) Set(key string, value interface{}) *ResCmd {
 	switch value.(type) {
 	case struct{}, map[string]string, map[string]interface{}:
 		b, _ := json.Marshal(value)
@@ -54,68 +60,113 @@ func (client *RedisClient) Set(key string, value interface{}) *ResCmd {
 	}
 }
 
-func (client *RedisClient) Get(key string) *ResCmd {
+func (client *Client) Get(key string) *ResCmd {
 	return client.send(fmt.Sprintf("get %s", key))
 }
 
-func (client *RedisClient) HSet(key string, value interface{}) error {
-	var handlerStruct func(prefix string, value interface{})
-	lua := "redis.call('hset', KEYS[1], KEYS[2], ARGV[1]);"
-	keys := make([]string, 2)
-	argv := make([]string, 1)
+func (client *Client) HSet(key string, value interface{}) error {
+	var handlerStruct func(prefix string, value *reflect.Value)
+	lua := "redis.call('hset', KEYS[%d], KEYS[%d], ARGV[%d]);"
+	keys := make([]string, 0)
+	argv := make([]string, 0)
 	script := "eval \""
-	handlerStruct = func(prefix string, value interface{}) {
-		v := reflect.ValueOf(value)
-		t := reflect.TypeOf(value)
-		if v.Kind() == reflect.Ptr {
-			v = v.Elem()
-			t = t.Elem()
-		}
-		for i := 0; i < v.NumField(); i++ {
-			field := v.Field(i)
+	v := reflect.ValueOf(value)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	handlerStruct = func(prefix string, value *reflect.Value) {
+		t := value.Type()
+		for i := 0; i < value.NumField(); i++ {
+			field := value.Field(i)
 			name := t.Field(i).Name
+			//fmt.Println(t.String())
 			switch field.Kind().String() {
 			case "struct":
-				handlerStruct(prefix+"."+name, field)
+				handlerStruct(prefix+"."+name, &field)
 			case "map":
 				ks := field.MapKeys()
 				for _, k := range ks {
 					keys = append(keys, prefix, toString(k))
 					argv = append(argv, toString(field.MapIndex(k)))
-					script += lua
+					l := len(keys)
+					script += fmt.Sprintf(lua, l-1, l, len(argv))
 				}
 			default:
 				keys = append(keys, prefix, name)
 				argv = append(argv, toString(field))
-				script += lua
+				l := len(keys)
+				script += fmt.Sprintf(lua, l-1, l, len(argv))
 			}
 		}
 	}
-	handlerStruct(key, value)
-	script = "" + script + "return ok;\" " + strconv.Itoa(len(keys))
+	_, ok := client.lock[key]
+	if !ok {
+		client.lock[key] = &sync.Mutex{}
+	}
+	client.lock[key].Lock()
+	defer client.lock[key].Unlock()
+	handlerStruct(key, &v)
+	script = "" + script + "return 'ok';\" " + strconv.Itoa(len(keys))
 	for _, i := range keys {
-		script += i
+		script += " " + i
 	}
 	for _, i := range argv {
-		script += i
+		script += " " + i
 	}
-	client.send("eval" + script)
+	client.send(script)
+	//client.send("hget wabapp.Health Url")
 	return nil
 }
 
-func (client *RedisClient) HGetField(key, field string) *ResCmd {
-
+func (client *Client) HGetField(key, field string) *ResCmd {
+	return nil
 }
 
-func (client *RedisClient) HSetField(key, field string, v interface{}) *ResCmd {
-
+func (client *Client) HSetField(key, field string, v interface{}) *ResCmd {
+	return client.send(fmt.Sprintf("hset %s %s %s", key, field, interfaceTurnString(v)))
 }
 
-func (client *RedisClient) HGet(key string, v interface{}) {
-
+func (client *Client) HGet(key string, v interface{}) error {
+	val := reflect.ValueOf(v)
+	if val.Kind() != reflect.Ptr {
+		return errors.New("结构体不是指针没办法获取值")
+	}
+	val = val.Elem()
+	var dfs func(prefix string, value *reflect.Value)
+	dfs = func(prefix string, value *reflect.Value) {
+		for i := 0; i < value.NumField(); i++ {
+			field := value.Field(i)
+			kind := field.Kind()
+			name := field.Type().Field(i).Name
+			res := client.send(fmt.Sprintf("hget %s %s", prefix, name))
+			if kind >= 2 && kind <= 11 {
+				va, _ := strconv.ParseInt(res.res, 10, 64)
+				field.SetInt(va)
+			}
+			if kind == 1 {
+				va, _ := strconv.ParseBool(res.res)
+				field.SetBool(va)
+			}
+			if kind == 24 {
+				va := res.res
+				field.SetString(va)
+			}
+			if kind == 25 {
+				dfs(prefix+"."+name, &field)
+			}
+		}
+	}
+	_, ok := client.lock[key]
+	if !ok {
+		client.lock[key] = &sync.Mutex{}
+	}
+	client.lock[key].Lock()
+	defer client.lock[key].Unlock()
+	dfs(key, &val)
+	return nil
 }
 
-func (client *RedisClient) send(order string) *ResCmd {
+func (client *Client) send(order string) *ResCmd {
 	b := make([]byte, 1024)
 	res := ""
 	n, err := client.conn.Write([]byte(order + "\r\n"))
@@ -138,8 +189,25 @@ func (client *RedisClient) send(order string) *ResCmd {
 	return handlerResult(res)
 }
 
+func (client *Client) ConnectMaster(master *Configure) error {
+	masterClient := &Client{}
+	masterClient.Open(master)
+	client.master = masterClient
+	res := client.send(fmt.Sprintf("slaveof %s %s", master.Host, master.Port))
+	return res.Error()
+}
+
+func interfaceTurnString(val interface{}) string {
+	v := reflect.ValueOf(val)
+	return toString(v)
+}
+
 func toString(val reflect.Value) string {
 	kind := val.Kind()
+	return turnStringByKind(kind, val)
+}
+
+func turnStringByKind(kind reflect.Kind, val reflect.Value) string {
 	if kind < 12 && kind > 1 {
 		return strconv.FormatInt(val.Int(), 10)
 	}
@@ -171,7 +239,7 @@ func handlerResult(res string) *ResCmd {
 		for ; res[i] != '\r'; i++ {
 			l = l*10 + int(res[i]-'0')
 		}
-		re.res = res[i:]
+		re.res = res[i+2 : len(res)-2]
 		re.len = int64(l)
 	case ':':
 	case ' ':
