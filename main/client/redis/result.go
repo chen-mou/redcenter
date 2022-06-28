@@ -17,6 +17,29 @@ type ResCmd struct {
 	len int64
 }
 
+type ArrayCmd struct {
+	err string
+	res []string
+	len int
+}
+
+func (cmd ArrayCmd) Result() any {
+	return cmd.res
+}
+
+func (cmd ArrayCmd) Error() error {
+	switch cmd.err {
+	case "":
+		return nil
+	case "-1":
+		return NilError{
+			msg: "value is nil",
+		}
+	default:
+		return errors.New(cmd.err)
+	}
+}
+
 func (err NilError) Error() string {
 	return err.msg
 }

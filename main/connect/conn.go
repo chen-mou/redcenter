@@ -7,8 +7,8 @@ import (
 )
 
 type Conn interface {
-	Close()
-	Open()
+	Close() error
+	Open() error
 }
 
 type Pool struct {

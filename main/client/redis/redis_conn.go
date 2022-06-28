@@ -17,10 +17,11 @@ const (
 )
 
 type Client struct {
-	Conf   *Configure
-	conn   net.Conn
-	master *Client
-	lock   lockMap
+	Conf    *Configure
+	conn    net.Conn
+	master  *Client
+	lock    lockMap
+	isClose bool
 }
 
 type Configure struct {
@@ -33,38 +34,69 @@ type Configure struct {
 
 type lockMap map[string]*sync.Mutex
 
-func (client *Client) Open(conf *Configure) {
+func (client *Client) Open() error {
+	client.lock = lockMap{
+		"Close":     &sync.Mutex{},
+		"PoolOrder": &sync.Mutex{},
+	}
+	client.lock["Close"].Lock()
+	defer client.lock["Close"].Unlock()
+	if client.isClose {
+		return errors.New("连接关闭后无法打开")
+	}
+	conf := client.Conf
 	con, err := net.Dial("tcp", conf.Host+":"+conf.Port)
 	if err != nil {
 		panic(err)
 	}
 	client.conn = con
-	client.lock = lockMap{}
+	return nil
 }
 
-func (client *Client) Set(key string, value interface{}) *ResCmd {
+func (client *Client) Close() error {
+	if client.lock["Close"] == nil {
+		return errors.New("连接未打开")
+	}
+	client.lock["Close"].Lock()
+	defer client.lock["Close"].Unlock()
+	if client.isClose {
+		return errors.New("连接已关闭")
+	}
+	client.isClose = true
+	return nil
+}
+
+func (client *Client) Set(key string, value interface{}) (*ResCmd, error) {
+	if client.Conf.Role == Follower {
+		return nil, errors.New("从机无法写入")
+	}
+	var res *ResCmd
 	switch value.(type) {
 	case struct{}, map[string]string, map[string]interface{}:
 		b, _ := json.Marshal(value)
-		return client.send(fmt.Sprintf("set %s %s", key, "\""+strings.Replace(string(b), "\"", "\\\"", -1)+"\""))
+		res = client.excute(fmt.Sprintf("set %s %s", key, "\""+strings.Replace(string(b), "\"", "\\\"", -1)+"\"")).(*ResCmd)
 	case string:
-		return client.send(fmt.Sprintf("set %s %s", key, value))
+		res = client.excute(fmt.Sprintf("set %s %s", key, value)).(*ResCmd)
 	case bool:
-		return client.send(fmt.Sprintf("set %s %t", key, value))
+		res = client.excute(fmt.Sprintf("set %s %t", key, value)).(*ResCmd)
 	case int8, int, int64, int32, uint, uint8, uint32, uint64:
-		return client.send(fmt.Sprintf("set %s %d", key, value))
+		res = client.excute(fmt.Sprintf("set %s %d", key, value)).(*ResCmd)
 	case float32, float64:
-		return client.send(fmt.Sprintf("set %s %f", key, value))
+		res = client.excute(fmt.Sprintf("set %s %f", key, value)).(*ResCmd)
 	default:
 		panic("类型:" + reflect.TypeOf(value).String() + "不支持")
 	}
+	return res, nil
 }
 
-func (client *Client) Get(key string) *ResCmd {
-	return client.send(fmt.Sprintf("get %s", key))
+func (client *Client) Get(key string) (*ResCmd, error) {
+	return client.excute(fmt.Sprintf("get %s", key)).(*ResCmd), nil
 }
 
 func (client *Client) HSet(key string, value interface{}) error {
+	if client.Conf.Role == Follower {
+		return errors.New("从机无法写入")
+	}
 	var handlerStruct func(prefix string, value *reflect.Value)
 	lua := "redis.call('hset', KEYS[%d], KEYS[%d], ARGV[%d]);"
 	keys := make([]string, 0)
@@ -78,7 +110,15 @@ func (client *Client) HSet(key string, value interface{}) error {
 		t := value.Type()
 		for i := 0; i < value.NumField(); i++ {
 			field := value.Field(i)
-			name := t.Field(i).Name
+			tField := t.Field(i)
+			name := tField.Name
+			tag, ok := tField.Tag.Lookup("json")
+			if ok {
+				if tag == "-" {
+					continue
+				}
+				name = tag
+			}
 			//fmt.Println(t.String())
 			switch field.Kind().String() {
 			case "struct":
@@ -86,8 +126,8 @@ func (client *Client) HSet(key string, value interface{}) error {
 			case "map":
 				ks := field.MapKeys()
 				for _, k := range ks {
-					keys = append(keys, prefix, toString(k))
-					argv = append(argv, toString(field.MapIndex(k)))
+					keys = append(keys, prefix+"."+name, toString(k))
+					argv = append(argv, "\""+toString(field.MapIndex(k))+"\"")
 					l := len(keys)
 					script += fmt.Sprintf(lua, l-1, l, len(argv))
 				}
@@ -113,17 +153,20 @@ func (client *Client) HSet(key string, value interface{}) error {
 	for _, i := range argv {
 		script += " " + i
 	}
-	client.send(script)
-	//client.send("hget wabapp.Health Url")
+	client.excute(script)
+	//client.excute("hget wabapp.Health Url")
 	return nil
 }
 
-func (client *Client) HGetField(key, field string) *ResCmd {
-	return nil
+func (client *Client) HGetField(key, field string) (*ResCmd, error) {
+	return client.excute(fmt.Sprintf("hget %s %s", key, field)).(*ResCmd), nil
 }
 
-func (client *Client) HSetField(key, field string, v interface{}) *ResCmd {
-	return client.send(fmt.Sprintf("hset %s %s %s", key, field, interfaceTurnString(v)))
+func (client *Client) HSetField(key, field string, v interface{}) (*ResCmd, error) {
+	if client.Conf.Role == Follower {
+		return nil, errors.New("从机无法写入")
+	}
+	return client.excute(fmt.Sprintf("hset %s %s %s", key, field, interfaceTurnString(v))).(*ResCmd), nil
 }
 
 func (client *Client) HGet(key string, v interface{}) error {
@@ -133,27 +176,53 @@ func (client *Client) HGet(key string, v interface{}) error {
 	}
 	val = val.Elem()
 	var dfs func(prefix string, value *reflect.Value)
+	var setValue func(field *reflect.Value, res Cmd)
+
 	dfs = func(prefix string, value *reflect.Value) {
 		for i := 0; i < value.NumField(); i++ {
 			field := value.Field(i)
-			kind := field.Kind()
-			name := field.Type().Field(i).Name
-			res := client.send(fmt.Sprintf("hget %s %s", prefix, name))
-			if kind >= 2 && kind <= 11 {
-				va, _ := strconv.ParseInt(res.res, 10, 64)
-				field.SetInt(va)
+			tField := value.Type().Field(i)
+			name := tField.Name
+			tag, ok := tField.Tag.Lookup("json")
+			if ok {
+				if tag == "-" {
+					continue
+				}
+				name = tag
 			}
-			if kind == 1 {
-				va, _ := strconv.ParseBool(res.res)
-				field.SetBool(va)
+			setValue = func(field *reflect.Value, res Cmd) {
+				kind := field.Kind()
+				switch {
+				case kind >= 2 && kind <= 11:
+					res := res.(*ResCmd)
+					va, _ := strconv.ParseInt(res.res, 10, 64)
+					field.SetInt(va)
+				case kind == 1:
+					res := res.(*ResCmd)
+					va, _ := strconv.ParseBool(res.res)
+					field.SetBool(va)
+				case kind == 24:
+					res := res.(*ResCmd)
+					va := res.res
+					field.SetString(va)
+				case kind == 21:
+					Map(field, res.(*ArrayCmd))
+				case kind == 23 || kind == 17:
+					Array(field, res)
+				case kind == 25:
+					dfs(prefix+"."+name, field)
+				}
 			}
-			if kind == 24 {
-				va := res.res
-				field.SetString(va)
+
+			var res Cmd
+			if field.Kind() == 21 {
+				res = client.excute(fmt.Sprintf("hgetall %s", prefix+"."+name))
+			} else if field.Kind() == 25 {
+				res = client.excute(fmt.Sprintf("hgetall %s", prefix+"."+name))
+			} else {
+				res = client.excute(fmt.Sprintf("hget %s %s", prefix, name))
 			}
-			if kind == 25 {
-				dfs(prefix+"."+name, &field)
-			}
+			setValue(&field, res)
 		}
 	}
 	_, ok := client.lock[key]
@@ -166,9 +235,22 @@ func (client *Client) HGet(key string, v interface{}) error {
 	return nil
 }
 
-func (client *Client) send(order string) *ResCmd {
+func (client *Client) RoleInfo() (*ResCmd, error) {
+	res := client.excute("info replication").(*ResCmd)
+	if res.Error() != nil {
+		return nil, res.Error()
+	}
+	//处理字符串结果
+	infos := strings.Split(res.res, "\r\n")
+	res.res = strings.Split(infos[1], ":")[1]
+	res.len = int64(len(res.res))
+	return res, nil
+}
+
+func (client *Client) excute(order string) Cmd {
 	b := make([]byte, 1024)
 	res := ""
+	client.lock["PoolOrder"].Lock()
 	n, err := client.conn.Write([]byte(order + "\r\n"))
 	if err != nil {
 		panic(err.Error())
@@ -177,6 +259,7 @@ func (client *Client) send(order string) *ResCmd {
 	if err != nil {
 		panic(err.Error())
 	}
+	client.lock["PoolOrder"].Unlock()
 	for n == 1024 {
 		res += string(b)
 		n, err = client.conn.Read(b)
@@ -190,11 +273,17 @@ func (client *Client) send(order string) *ResCmd {
 }
 
 func (client *Client) ConnectMaster(master *Configure) error {
-	masterClient := &Client{}
-	masterClient.Open(master)
+	masterClient := &Client{
+		Conf: master,
+	}
+	masterClient.Open()
 	client.master = masterClient
-	res := client.send(fmt.Sprintf("slaveof %s %s", master.Host, master.Port))
+	res := client.excute(fmt.Sprintf("slaveof %s %s", master.Host, master.Port))
 	return res.Error()
+}
+
+func (client *Client) Ping() *ResCmd {
+	return client.excute("ping").(*ResCmd)
 }
 
 func interfaceTurnString(val interface{}) string {
@@ -207,44 +296,109 @@ func toString(val reflect.Value) string {
 	return turnStringByKind(kind, val)
 }
 
+//将value类型转换为字符串
 func turnStringByKind(kind reflect.Kind, val reflect.Value) string {
+	//val 是整数
 	if kind < 12 && kind > 1 {
 		return strconv.FormatInt(val.Int(), 10)
 	}
+	//val 是浮点数
 	if kind == 13 {
 		return strconv.FormatFloat(val.Float(), 'f', 10, 32)
 	} else if kind == 14 {
 		return strconv.FormatFloat(val.Float(), 'f', 10, 64)
 	}
+	//val 是布尔类型
 	if kind == 1 {
 		return strconv.FormatBool(val.Bool())
 	}
+	//val 是字符串
 	if kind == 24 {
 		return val.String()
+	}
+	//val 是数组类型
+	if kind == 23 || kind == 17 {
+		first := val.Index(0)
+		res := "[" + turnStringByKind(first.Kind(), first)
+		for i := 1; i < val.Len(); i++ {
+			v := val.Index(i)
+			res += "," + turnStringByKind(first.Kind(), v)
+		}
+		res += "]"
+		return res
 	}
 	return ""
 }
 
-func handlerResult(res string) *ResCmd {
-	re := &ResCmd{}
+func handlerResult(res string) Cmd {
+	var re Cmd
+	getNumber := func(s string) (string, int) {
+		num := 0
+		for s[0] != '\r' {
+			num = num*10 + int(s[0]-'0')
+			s = s[1:]
+		}
+		return s, num
+	}
+	//fmt.Println(res)
 	switch res[0] {
 	case '-':
-		re.err = res[1:]
-		re.len = 0
-	case '+':
-		re.res = res[1:]
-	case '$':
-		l := 0
-		i := 1
-		for ; res[i] != '\r'; i++ {
-			l = l*10 + int(res[i]-'0')
+		re = &ResCmd{
+			err: res[1 : len(res)-2],
+			len: 0,
 		}
-		re.res = res[i+2 : len(res)-2]
-		re.len = int64(l)
+	case '+':
+		re = &ResCmd{
+			res: res[1 : len(res)-2],
+		}
+	case '$':
+		isMinus := false
+		if res[1] == '-' {
+			isMinus = true
+		}
+		l := 0
+		res, l = getNumber(res)
+		if isMinus {
+			l = -l
+		}
+		if l == -1 {
+			re = &ResCmd{
+				res: "",
+				len: 0,
+				err: "-1",
+			}
+			return re
+		}
+		re = &ResCmd{
+			res: res[2 : len(res)-2],
+			len: int64(l),
+		}
 	case ':':
 	case ' ':
+	case '*':
+		res = res[1:]
+		num := 0
+		res, num = getNumber(res)
+		res = res[2:]
+		result := make([]string, num)
+		for i := 0; i < num; i++ {
+			res = res[1:]
+			length := 0
+			res, length = getNumber(res)
+			result[i] = res[2 : length+2]
+			res = res[length+4:]
+		}
+		re = &ArrayCmd{
+			res: result,
+			err: "",
+			len: num,
+		}
 	default:
 
 	}
 	return re
+}
+
+func (client *Client) Execute(s string) Cmd {
+	return client.excute(s)
 }
