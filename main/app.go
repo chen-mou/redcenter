@@ -1,8 +1,8 @@
 package main
 
 import (
+	"RedisRegister/main/client/redcenter/protool"
 	"RedisRegister/main/client/redis"
-	"RedisRegister/main/client/web/protool"
 	"encoding/json"
 	"flag"
 	"fmt"

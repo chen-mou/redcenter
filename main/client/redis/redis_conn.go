@@ -22,6 +22,7 @@ type Client struct {
 	master  *Client
 	lock    lockMap
 	isClose bool
+	index   int
 }
 
 type Configure struct {
@@ -42,15 +43,12 @@ func (client *Client) Open() error {
 	client.lock["Close"].Lock()
 	defer client.lock["Close"].Unlock()
 	if client.isClose {
-		return errors.New("连接关闭后无法打开")
+		client.isClose = false
 	}
 	conf := client.Conf
 	con, err := net.Dial("tcp", conf.Host+":"+conf.Port)
-	if err != nil {
-		panic(err)
-	}
 	client.conn = con
-	return nil
+	return err
 }
 
 func (client *Client) Close() error {
@@ -62,6 +60,8 @@ func (client *Client) Close() error {
 	if client.isClose {
 		return errors.New("连接已关闭")
 	}
+	client.conn.Close()
+	client.conn = nil
 	client.isClose = true
 	return nil
 }
