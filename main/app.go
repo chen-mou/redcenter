@@ -1,8 +1,8 @@
 package main
 
 import (
-	"RedisRegister/main/client/redcenter/protool"
 	"RedisRegister/main/client/redis"
+	"RedisRegister/main/server/redcenter/protool"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,7 +25,7 @@ func main() {
 	//c.
 	conn.Open()
 
-	conn.HSet("Head", protool.Head{
+	conn.HSet("Head", protool.Header{
 		Auth: "123456789",
 		Custom: map[string][]string{
 			"Content-Type": {"application/json", "application/xml"},
@@ -33,7 +33,7 @@ func main() {
 		},
 	})
 	fmt.Println(conn.Execute("HGET Head.Custom Content-Type").Result())
-	val := protool.Head{}
+	val := protool.Header{}
 	conn.HGet("Head", &val)
 	b, _ := json.Marshal(val)
 	fmt.Println(string(b))
