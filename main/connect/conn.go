@@ -142,11 +142,12 @@ func HandWait(contain *contain, w *wait, builder ConnBuilder) {
 
 func Build(coreNum, maxNum, waitLen int, builder ConnBuilder) *Pool {
 	p := &Pool{
-		core:    build(coreNum),
-		wait:    make(chan *wait, waitLen),
-		builder: builder,
-		max:     nil,
-		maxN:    maxNum,
+		core:        build(coreNum),
+		wait:        make(chan *wait, waitLen),
+		builder:     builder,
+		max:         nil,
+		maxN:        maxNum,
+		maxLiveTime: time.Minute * 20,
 	}
 	go func(p *Pool) {
 		for {
@@ -159,79 +160,90 @@ func Build(coreNum, maxNum, waitLen int, builder ConnBuilder) *Pool {
 	return p
 }
 
+func openMax(p *Pool) {
+	ctx, _ := context.WithTimeout(context.Background(), p.maxLiveTime)
+	for {
+		select {
+		case <-ctx.Done():
+			p.max.Close()
+			p.max = nil
+			return
+		case w := <-p.wait:
+			ctx, _ = context.WithTimeout(context.Background(), p.maxLiveTime)
+			HandWait(p.max, w, p.builder)
+		}
+	}
+}
+
 func (p *Pool) Submit(tim int64, f func(Conn) interface{}, reject func()) (<-chan interface{}, error) {
-	ch := make(chan Conn, 1)
+	type chElem struct {
+		c *contain
+
+		con Conn
+	}
+	ch := make(chan *chElem, 1)
 	res := make(chan interface{}, 1)
-	var c *contain
-	//now := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(tim))
-	//fmt.Println(now.String())
-	go func() {
-		for {
+
+	ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(tim))
+
+	for {
+		select {
+		case <-ctx.Done():
+			//超时处理
+			go func() {
+				elem, ok := <-ch
+				if !ok || elem == nil {
+					return
+				}
+				elem.c.backIdleConn(elem.con)
+			}()
+			if reject != nil {
+				reject()
+			}
+			return nil, errors.New("timeout")
+		case elem := <-ch:
+			//获取连接后处理连接
+			if elem == nil {
+				return res, nil
+			}
+			go func() {
+				res <- f(elem.con)
+				elem.c.backIdleConn(elem.con)
+				close(res)
+			}()
+			return res, nil
+		default:
+			//尝试获取连接
+			f1 := func(c1 *contain, conn Conn) {
+				elem := &chElem{
+					c1, conn,
+				}
+				ch <- elem
+				close(ch)
+			}
 			conn, err := p.core.getIdleConn(p.builder)
 			if err != nil {
 				select {
 				case p.wait <- &wait{res, f}:
 					ch <- nil
-					cancel()
-					return
 				default:
 					if p.max == nil {
 						//开启额外的连接处理队列
 						p.Lock()
 						if p.max == nil {
 							p.max = build(p.maxN)
-							go func(p *Pool) {
-								ctx, _ := context.WithTimeout(context.Background(), p.maxLiveTime*time.Second)
-								for {
-									select {
-									case <-ctx.Done():
-										p.max.Close()
-										p.max = nil
-										return
-									case w := <-p.wait:
-										ctx, _ = context.WithTimeout(context.Background(), p.maxLiveTime*time.Second)
-										HandWait(p.max, w, p.builder)
-
-									}
-								}
-							}(p)
+							go openMax(p)
 						}
 						p.Unlock()
-						c = p.max
-						ch <- conn
-						close(ch)
-						cancel()
-						return
 					}
 					conn, err = p.max.getIdleConn(p.builder)
+					if err == nil {
+						f1(p.max, conn)
+					}
 				}
 			} else {
-				c = p.core
-				ch <- conn
-				close(ch)
-				break
+				f1(p.core, conn)
 			}
 		}
-		cancel()
-	}()
-	select {
-	case <-ctx.Done():
-		go func(c *contain) {
-			c.backIdleConn(<-ch)
-		}(c)
-		if reject != nil {
-			reject()
-		}
-		return nil, errors.New("timeout")
-	case conn := <-ch:
-		if conn == nil {
-			return res, nil
-		}
-		go func(c *contain) {
-			res <- f(conn)
-			c.backIdleConn(conn)
-		}(c)
-		return res, nil
 	}
 }
