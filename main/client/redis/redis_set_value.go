@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+//TODO: 记得改下Array有根据下标取值的需求
+
 func Atov(s string, t reflect.Type) reflect.Value {
 	kind := t.Kind()
 	switch {
@@ -91,6 +93,7 @@ func array(s string, t reflect.Type) reflect.Value {
 	return r
 }
 
+// Array TODO: 修改这里的逻辑
 func Array(field *reflect.Value, res Cmd) {
 	switch res.(type) {
 	case *ResCmd:

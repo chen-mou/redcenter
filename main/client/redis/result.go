@@ -23,6 +23,19 @@ type ArrayCmd struct {
 	len int
 }
 
+type NumberCmd struct {
+	err string
+	res int
+}
+
+func (cmd NumberCmd) Result() any {
+	return cmd.res
+}
+
+func (cmd NumberCmd) Error() error {
+	return errors.New(cmd.err)
+}
+
 func (cmd ArrayCmd) Result() any {
 	return cmd.res
 }

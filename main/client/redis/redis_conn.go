@@ -120,16 +120,27 @@ func (client *Client) HSet(key string, value interface{}) error {
 				name = tag
 			}
 			//fmt.Println(t.String())
-			switch field.Kind().String() {
-			case "struct":
+		LOOP:
+			switch field.Kind() {
+			case reflect.Ptr:
+				field = field.Elem()
+				break LOOP
+			case reflect.Struct:
 				handlerStruct(prefix+"."+name, &field)
-			case "map":
+			case reflect.Map:
 				ks := field.MapKeys()
 				for _, k := range ks {
 					keys = append(keys, prefix+"."+name, toString(k))
 					argv = append(argv, "\""+toString(field.MapIndex(k))+"\"")
 					l := len(keys)
 					script += fmt.Sprintf(lua, l-1, l, len(argv))
+				}
+			case reflect.Array, reflect.Slice:
+				keys = append(keys, prefix+"."+name)
+				script += fmt.Sprintf("redis.call('LPUSH', KEYS[%d]", len(keys))
+				for i := 0; i < field.Len(); i++ {
+					argv = append(argv, toString(field.Index(i)))
+					script += fmt.Sprintf(",ARGV[%d]", len(argv))
 				}
 			default:
 				keys = append(keys, prefix, name)
@@ -215,9 +226,9 @@ func (client *Client) HGet(key string, v interface{}) error {
 			}
 
 			var res Cmd
-			if field.Kind() == 21 {
+			if field.Kind() == reflect.Map {
 				res = client.excute(fmt.Sprintf("hgetall %s", prefix+"."+name))
-			} else if field.Kind() == 25 {
+			} else if field.Kind() == reflect.Struct {
 				res = client.excute(fmt.Sprintf("hgetall %s", prefix+"."+name))
 			} else {
 				res = client.excute(fmt.Sprintf("hget %s %s", prefix, name))
@@ -245,6 +256,42 @@ func (client *Client) RoleInfo() (*ResCmd, error) {
 	res.res = strings.Split(infos[1], ":")[1]
 	res.len = int64(len(res.res))
 	return res, nil
+}
+
+func (client *Client) LLen(key string) (int, error) {
+	res := client.excute("LLen " + key)
+	return res.Result().(int), res.Error()
+}
+
+func (client *Client) push(order, key string, vals ...interface{}) *NumberCmd {
+	o := order + " " + key
+	for _, v := range vals {
+		o += " " + toString(reflect.ValueOf(v))
+	}
+	cmd := client.excute(o)
+	return cmd.(*NumberCmd)
+}
+
+func (client *Client) LPush(key string, vals ...interface{}) *NumberCmd {
+	return client.push("lpush", key, vals)
+}
+
+func (client *Client) RPush(key string, vals ...interface{}) *NumberCmd {
+	return client.push("rpush", key, vals)
+}
+
+// BindLIndex 获取数组第index + 1 个位置的值v要是指针
+func (client *Client) BindLIndex(key string, index int, v interface{}) error {
+	res := client.excute(fmt.Sprintf("lindex %s %d", key, index))
+	if res.Error() != nil {
+		return res.Error()
+	}
+	json.Unmarshal([]byte(res.Result().(string)), v)
+	return nil
+}
+
+func (client *Client) LIndex(key string, index int) *ResCmd {
+	return client.excute(fmt.Sprintf("lindex %s %d", key, index)).(*ResCmd)
 }
 
 func (client *Client) excute(order string) Cmd {
@@ -326,6 +373,13 @@ func turnStringByKind(kind reflect.Kind, val reflect.Value) string {
 		}
 		res += "]"
 		return res
+	}
+	if kind == reflect.Struct {
+		b, _ := json.Marshal(val.Interface())
+		return string(b)
+	}
+	if kind == reflect.Ptr {
+		return toString(val.Elem())
 	}
 	return ""
 }

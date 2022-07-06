@@ -124,8 +124,11 @@ func (ctx *Context) BindJson(val interface{}) error {
 	if t.Kind() != reflect.Ptr {
 		return errors.New("非指针类型无法赋值")
 	}
-	b, _ := json.Marshal(ctx.Body.Data)
-	err := json.Unmarshal(b, val)
+	b, err := json.Marshal(ctx.Body.Data)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(b, val)
 	if err != nil {
 		return err
 	}
@@ -167,6 +170,14 @@ func (ctx *Context) AbortWithJson(v interface{}) error {
 	}
 	ctx.conn.Write(Successful("成功", b))
 	return ctx.conn.Close()
+}
+
+func (ctx *Context) AbortWithError(err error) {
+	ctx.conn.Write(Error(err.Error()))
+}
+
+func (ctx *Context) AbortWithFail(code, msg string) {
+	ctx.conn.Write(Fail(code, msg))
 }
 
 func (ctx *Context) Abort() error {

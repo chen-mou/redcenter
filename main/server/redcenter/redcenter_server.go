@@ -23,6 +23,11 @@ type WebConfig struct {
 	Verify   func(string) bool
 }
 
+type DB interface {
+	Save(v interface{}) error
+	Get(args ...interface{}) (interface{}, error)
+}
+
 type Server struct {
 	conf   *Configure
 	wconf  *WebConfig
@@ -156,7 +161,7 @@ func (s *Server) Group(path string) *Node {
 	}
 }
 
-func (s Server) Run() error {
+func (s *Server) Run() error {
 	s.logger.Info("准备连接redis")
 
 	err := redis.Pool.Dail(s.conf.RedisConf)
